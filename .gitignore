@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
+NEMEZIS_koncepcja.md
+STATE.md
+POSEIDON_GUIDE.md
+recon/FINDINGS.md
