@@ -6,32 +6,57 @@
 
 CREATE SCHEMA IF NOT EXISTS core;
 
+-- Parsuje kwoty jak w zrodle ("374020,05                PLN", "60000", "6380212.28")
+-- do NUMERIC: usuwa wszystko poza cyframi/przecinkiem/kropka/minusem, przecinek jako
+-- separator dziesietny -> kropka. Zalozenie (potwierdzone na probkach BZP i TED do tej
+-- pory): BEZ separatora tysiecy. Puste/nieliczbowe wejscie (np. "Nie" z niepasujacego
+-- pola formularza) -> NULL, nie blad rzutowania.
+CREATE OR REPLACE FUNCTION staging.parse_pl_amount(raw_val TEXT)
+RETURNS NUMERIC AS $$
+    -- Walidacja wzorcem PRZED rzutowaniem -- same znaki interpunkcyjne bez cyfr (np.
+    -- pojedynczy "-" jako placeholder "nie dotyczy" w formularzu) po oczyszczeniu
+    -- zostawialyby np. "-", co wywala ::NUMERIC zamiast dac NULL. Znalezione na zywych
+    -- danych (2026-08-04, sesja 2), nie teoretycznie.
+    SELECT CASE
+        WHEN regexp_replace(coalesce(raw_val, ''), '[^0-9,.-]', '', 'g') ~ '^-?[0-9]+([,.][0-9]+)?$'
+        THEN replace(regexp_replace(raw_val, '[^0-9,.-]', '', 'g'), ',', '.')::NUMERIC
+        ELSE NULL
+    END
+$$ LANGUAGE SQL IMMUTABLE;
+
 -- ============================================================
 -- Warstwa posrednia: nazwane kolumny z JSONB
 -- ============================================================
 
 CREATE OR REPLACE VIEW staging.v_bzp_parsed AS
 SELECT
-    id AS bzp_row_id,
-    notice_id AS bzp_notice_id,
-    staging.clean_nip(payload->>'organizationNationalId')   AS nip_zamawiajacy,
+    r.id AS bzp_row_id,
+    r.notice_id AS bzp_notice_id,
+    staging.clean_nip(r.payload->>'organizationNationalId')   AS nip_zamawiajacy,
     -- REGON zamawiajacego jest tylko w htmlBody (SEKCJA I, "1.3.) Krajowy Numer
     -- Identyfikacyjny: REGON XXXXXXXXX"), nie ma go jako czyste pole JSON. BZP-owy NIP
     -- jest niezawodny (potwierdzone na probce), wiec REGON jest tu potrzebny wylacznie
     -- jako klucz do dopasowania z TED, gdy TED zgloszil REGON zamiast NIP -- nie do
     -- identyfikacji zamawiajacego po stronie BZP samej w sobie. Wzorzec zwalidowany na
     -- realnym htmlBody (recon/) przed wdrozeniem.
-    staging.clean_regon(substring(payload->>'htmlBody' from
+    staging.clean_regon(substring(r.payload->>'htmlBody' from
         'Krajowy Numer Identyfikacyjny:\s*<span class="normal">\s*REGON\s*(\d+)'))
                                                               AS regon_zamawiajacy,
-    (payload->>'publicationDate')::timestamptz::date         AS data_publikacji,
-    -- Brak wprost pola "wartosc szacunkowa" w JSON listy -- do potwierdzenia w Fazie
-    -- godzenia po zbudowaniu warstwy wyciagania pol z SEKCJA IV htmlBody (patrz dol pliku).
-    NULL::numeric                                             AS wartosc_szacunkowa,
+    (r.payload->>'publicationDate')::timestamptz::date         AS data_publikacji,
+    -- [2026-08-04, sesja 2] Wpiete: kod 4.3.) "Wartosc zamowienia" to poziom calej
+    -- procedury -- ten sam ziarno, na ktorym dzis dziala matching (przed unnest po
+    -- czesciach). Zrodlo: staging.bzp_form_parsed, wypelniane przez parse_bzp_form.py
+    -- inline w fetch_bzp.py (czesc_nr IS NULL = poziom naglowka/procedury, nie czesci).
+    fp.wartosc_szacunkowa                                     AS wartosc_szacunkowa,
     NULL::text                                                AS ted_reference,  -- twarda referencja TED w BZP -- pole jeszcze nie zlokalizowane, patrz FINDINGS.md
-    NOT (payload->>'isTenderAmountBelowEU')::boolean          AS czy_powyzej_progu_ue,  -- Znalezisko 1: prawdziwa flaga z API, nie heurystyka
-    payload
-FROM staging.bzp_notices_raw;
+    NOT (r.payload->>'isTenderAmountBelowEU')::boolean          AS czy_powyzej_progu_ue,  -- Znalezisko 1: prawdziwa flaga z API, nie heurystyka
+    r.payload
+FROM staging.bzp_notices_raw r
+LEFT JOIN (
+    SELECT bzp_row_id, staging.parse_pl_amount(wartosc) AS wartosc_szacunkowa
+    FROM staging.bzp_form_parsed
+    WHERE code = '4.3.)' AND czesc_nr IS NULL
+) fp ON fp.bzp_row_id = r.id;
 
 CREATE OR REPLACE VIEW staging.v_ted_parsed AS
 SELECT
@@ -46,12 +71,16 @@ SELECT
     staging.clean_nip(payload->>'organisation-identifier-buyer')   AS nip_zamawiajacy,
     staging.clean_regon(payload->>'organisation-identifier-buyer') AS regon_zamawiajacy,
     (payload->>'publication-date')::date                         AS data_publikacji,
-    -- UWAGA: NIE 'tender-value' (to cena WYGRANEJ oferty -- wynik, nie szacunek).
-    -- Do matchingu potrzebny szacunek po stronie TED, kandydat 'estimated-value-cur-lot',
-    -- jeszcze niepotwierdzony bezposrednio (patrz FINDINGS_TED.md Znalezisko 1). Uzycie
-    -- tender-value do matchingu zniek​stalcaloby wynik, bo roznica szacunek<->cena
-    -- koncowa to dokladnie to, co ten projekt mierzy.
-    NULL::numeric                                                 AS wartosc_szacunkowa,
+    -- [2026-08-04, sesja 2] Wpiete: estimated-value-proc (skalar, jedna wartosc na cala
+    -- procedure) -- NIE estimated-value-lot (tablica, jedna wartosc PER LOT, wymaga
+    -- unnest -- ten sam nierozstrzygniety problem kolejnosci co czesci po stronie BZP,
+    -- patrz POSEIDON_GUIDE.md) i NIE '-cur-' warianty (to WALUTA "PLN", nie kwota --
+    -- znalezione i naprawione tej samej sesji). '-proc' wybrany bo pasuje do dzisiejszego
+    -- ziarna matchingu (cala procedura, przed unnest) i ma lepsze pokrycie na probce
+    -- form-type=result (39/100) niz '-lot' (11/100) czy '-part' (0/100). Nadal NIE
+    -- 'tender-value' -- to cena WYGRANEJ oferty (wynik), nie szacunek; uzycie go
+    -- zniek​stalcaloby dokladnie to, co ten projekt mierzy (premia = szacunek vs cena).
+    staging.parse_pl_amount(payload->>'estimated-value-proc')    AS wartosc_szacunkowa,
     payload
 FROM staging.ted_notices_raw;
 

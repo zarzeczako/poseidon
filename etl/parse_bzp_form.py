@@ -40,22 +40,32 @@ def parse_bzp_html_body(html: str) -> dict:
         section_num = int(code.split(".", 1)[0])
         entry = {"etykieta": m.group("label").strip(), "wartosc": m.group("value").strip()}
 
-        if section_num <= 4:
-            naglowek[code] = entry
-            continue
-
         part = None
         for marker_pos, n in markers:
             if marker_pos <= m.start():
                 part = n
             else:
                 break
-        # SEKCJA V-VIII bez zadnego znacznika "Czesc N" -> postepowanie jednoczesciowe,
-        # forma pomija numeracje czesci gdy nie ma czego rozroznic. Potwierdzone na
-        # realnej probce (2026/BZP 00315920) -- bez tej reguly te pola trafialyby do
-        # naglowka zamiast do czesci[1], niespojnie z postepowaniami wieloczesciowymi.
+
         if part is None:
+            # Zaden znacznik "Czesc N" jeszcze sie nie pojawil przed tym polem.
+            if section_num <= 4:
+                # SEKCJA I-IV przed pierwszym znacznikiem czesci to dane calej
+                # procedury (np. 4.3.) Wartosc zamowienia), nie per-czesc.
+                naglowek[code] = entry
+                continue
+            # SEKCJA V-VIII bez zadnego znacznika "Czesc N" -> postepowanie jednoczesciowe,
+            # forma pomija numeracje czesci gdy nie ma czego rozroznic. Potwierdzone na
+            # realnej probce (2026/BZP 00315920) -- bez tej reguly te pola trafialyby do
+            # naglowka zamiast do czesci[1], niespojnie z postepowaniami wieloczesciowymi.
             part = 1
+
+        # UWAGA (2026-08-04, sesja 2): SEKCJA IV ma pola PO-CZESCIOWE zagniezdzone pod
+        # wlasnymi znacznikami "Czesc N" (np. 4.5.5.) Wartosc czesci, powtarzajace sie
+        # per czesc) -- section_num<=4 NIE znaczy "zawsze naglowek". Sprawdzone na
+        # realnej probce (2026/BZP 00315919, 3 czesci): bez routingu przez `part` tutaj,
+        # 4.5.5.) ladowal do plaskiego naglowka i kazda kolejna czesc po cichu nadpisywala
+        # poprzednia wartosc -- 2 z 3 wartosci czesci ginely bez sladu.
         czesci.setdefault(part, {})[code] = entry
 
     return {"naglowek": naglowek, "czesci": czesci}

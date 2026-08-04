@@ -20,6 +20,8 @@ FIELDS = [
     "publication-number",
     "publication-date",
     "notice-title",
+    "notice-type",
+    "form-type",
     "organisation-country-buyer",
     "organisation-identifier-buyer",
     "organisation-name-buyer",
@@ -31,7 +33,17 @@ FIELDS = [
     "winner-selection-status",
     "received-submissions-type-val",
     "received-submissions-type-code",
+    # UWAGA (2026-08-04): "-cur-" to pole WALUTY ("PLN"), nie kwoty -- potwierdzone na
+    # zywych danych (7 rekordow, wszystkie zwracaly wylacznie ['PLN']). Kwota jest w
+    # osobnym polu bez "-cur-". TED ma szacunek na 4 poziomach granularnosci
+    # (lot/part/proc/glo) -- ciagniemy wszystkie 4 + ich waluty, zeby na zywych danych
+    # sprawdzic, ktory poziom sie faktycznie wypelnia, zamiast zgadywac.
+    "estimated-value-lot",
     "estimated-value-cur-lot",
+    "estimated-value-part",
+    "estimated-value-cur-part",
+    "estimated-value-proc",
+    "estimated-value-cur-proc",
 ]
 
 
