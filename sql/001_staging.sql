@@ -66,3 +66,43 @@ RETURNS BOOLEAN AS $$
         ) % 11 = substring(nip,10,1)::int
     END
 $$ LANGUAGE SQL IMMUTABLE;
+
+-- ============================================================
+-- Funkcje czyszczace -- REGON
+-- Potrzebne jako fallback przy godzeniu BZP<->TED: TED miesza NIP i REGON w tym samym
+-- polu (organisation-identifier-buyer), patrz recon/FINDINGS_TED.md Znalezisko 2.
+-- Architekt zdecydowal (2026-08-04): najpierw probowac NIP, REGON tylko jako fallback.
+-- ============================================================
+
+-- Jak clean_nip, ale dla REGON-9 (krotka forma, 9 cyfr). REGON-14 (jednostki lokalne
+-- wiekszych podmiotow) nie jest tu obslugiwany -- nie zaobserwowany jeszcze w probkach.
+CREATE OR REPLACE FUNCTION staging.clean_regon(raw_id TEXT)
+RETURNS CHAR(9) AS $$
+    SELECT CASE
+        WHEN length(regexp_replace(coalesce(raw_id, ''), '\D', '', 'g')) = 9
+            THEN regexp_replace(raw_id, '\D', '', 'g')::CHAR(9)
+        ELSE NULL
+    END
+$$ LANGUAGE SQL IMMUTABLE;
+
+-- Walidacja sumy kontrolnej REGON-9 (wagi 8,9,2,3,4,5,6,7 na pierwszych 8 cyfrach,
+-- suma mod 11; jesli wynik = 10, kontrolna cyfra to 0).
+CREATE OR REPLACE FUNCTION staging.is_valid_regon(regon CHAR(9))
+RETURNS BOOLEAN AS $$
+    SELECT CASE
+        WHEN regon !~ '^\d{9}$' THEN FALSE
+        ELSE (
+            CASE WHEN (
+                8*substring(regon,1,1)::int + 9*substring(regon,2,1)::int + 2*substring(regon,3,1)::int +
+                3*substring(regon,4,1)::int + 4*substring(regon,5,1)::int + 5*substring(regon,6,1)::int +
+                6*substring(regon,7,1)::int + 7*substring(regon,8,1)::int
+            ) % 11 = 10 THEN 0
+            ELSE (
+                8*substring(regon,1,1)::int + 9*substring(regon,2,1)::int + 2*substring(regon,3,1)::int +
+                3*substring(regon,4,1)::int + 4*substring(regon,5,1)::int + 5*substring(regon,6,1)::int +
+                6*substring(regon,7,1)::int + 7*substring(regon,8,1)::int
+            ) % 11
+            END
+        ) = substring(regon,9,1)::int
+    END
+$$ LANGUAGE SQL IMMUTABLE;

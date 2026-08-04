@@ -15,6 +15,15 @@ SELECT
     id AS bzp_row_id,
     notice_id AS bzp_notice_id,
     staging.clean_nip(payload->>'organizationNationalId')   AS nip_zamawiajacy,
+    -- REGON zamawiajacego jest tylko w htmlBody (SEKCJA I, "1.3.) Krajowy Numer
+    -- Identyfikacyjny: REGON XXXXXXXXX"), nie ma go jako czyste pole JSON. BZP-owy NIP
+    -- jest niezawodny (potwierdzone na probce), wiec REGON jest tu potrzebny wylacznie
+    -- jako klucz do dopasowania z TED, gdy TED zgloszil REGON zamiast NIP -- nie do
+    -- identyfikacji zamawiajacego po stronie BZP samej w sobie. Wzorzec zwalidowany na
+    -- realnym htmlBody (recon/) przed wdrozeniem.
+    staging.clean_regon(substring(payload->>'htmlBody' from
+        'Krajowy Numer Identyfikacyjny:\s*<span class="normal">\s*REGON\s*(\d+)'))
+                                                              AS regon_zamawiajacy,
     (payload->>'publicationDate')::timestamptz::date         AS data_publikacji,
     -- Brak wprost pola "wartosc szacunkowa" w JSON listy -- do potwierdzenia w Fazie
     -- godzenia po zbudowaniu warstwy wyciagania pol z SEKCJA IV htmlBody (patrz dol pliku).
@@ -30,10 +39,12 @@ SELECT
     notice_id AS ted_notice_id,
     -- Potwierdzone na Search API v3 (recon/FINDINGS_TED.md): identyfikator bywa NIP
     -- (czasem z etykietą "NIP: " i myslnikami -- clean_nip() to ogarnia) ALBO REGON
-    -- (9 cyfr -- clean_nip() poprawnie zwroci NULL, bo wymaga dokladnie 10). Realna
-    -- konsekwencja: czesc par BZP<->TED nie dopasuje sie po NIP, bo TED ma tam REGON.
-    -- Fallback na REGON nierozstrzygniety, patrz FINDINGS_TED.md Znalezisko 2.
-    staging.clean_nip(payload->>'organisation-identifier-buyer') AS nip_zamawiajacy,
+    -- (9 cyfr). To samo surowe pole probujemy wyczyscic dwoma funkcjami -- ktorakolwiek
+    -- pasuje do dlugosci, ta wygrywa. Architekt zdecydowal (2026-08-04): NIP ma
+    -- pierwszenstwo w matchingu, REGON tylko jako fallback dla par, ktore nie znalazly
+    -- dopasowania po NIP (patrz core.v_matches_fuzzy_regon_candidates nizej).
+    staging.clean_nip(payload->>'organisation-identifier-buyer')   AS nip_zamawiajacy,
+    staging.clean_regon(payload->>'organisation-identifier-buyer') AS regon_zamawiajacy,
     (payload->>'publication-date')::date                         AS data_publikacji,
     -- UWAGA: NIE 'tender-value' (to cena WYGRANEJ oferty -- wynik, nie szacunek).
     -- Do matchingu potrzebny szacunek po stronie TED, kandydat 'estimated-value-cur-lot',
@@ -109,9 +120,16 @@ WHERE b.ted_reference IS NOT NULL;
 -- Kandydat musi byc WZAJEMNIE najlepszym dopasowaniem po obu stronach (podwojny
 -- ranking) -- inaczej jeden BZP moglby "ukrasc" dwa rekordy TED (albo odwrotnie),
 -- gdy zamawiajacy publikuje 2+ podobne przetargi w tym samym tygodniu.
+--
+-- Dwie warstwy, w tej kolejnosci (Architekt, 2026-08-04: "bardziej ufam NIPowi"):
+--   2a. fuzzy po NIP (pierwszenstwo)
+--   2b. fuzzy po REGON, TYLKO dla BZP-rekordow ktore NIE dostaly dopasowania w 2a --
+--       bo TED czasem ma REGON zamiast NIP w tym samym polu (FINDINGS_TED.md, Znal. 2)
 -- ============================================================
 
-CREATE OR REPLACE VIEW core.v_matches_fuzzy_candidates AS
+-- --- 2a: NIP ---
+
+CREATE OR REPLACE VIEW core.v_matches_fuzzy_nip_candidates AS
 SELECT
     b.bzp_row_id,
     t.ted_row_id,
@@ -125,26 +143,71 @@ JOIN staging.v_ted_parsed t
     AND ABS(b.data_publikacji - t.data_publikacji) <= 7
     AND ABS(b.wartosc_szacunkowa - t.wartosc_szacunkowa) / NULLIF(b.wartosc_szacunkowa, 0) <= 0.02
 WHERE b.czy_powyzej_progu_ue
+  AND b.nip_zamawiajacy IS NOT NULL
   AND b.bzp_row_id NOT IN (SELECT bzp_row_id FROM core.v_matches_exact)
   AND t.ted_row_id NOT IN (SELECT ted_row_id FROM core.v_matches_exact);
 
-CREATE OR REPLACE VIEW core.v_matches_fuzzy AS
-SELECT bzp_row_id, ted_row_id, 'fuzzy_heuristic'::text AS match_method
+CREATE OR REPLACE VIEW core.v_matches_fuzzy_nip AS
+SELECT bzp_row_id, ted_row_id, 'fuzzy_heuristic_nip'::text AS match_method
 FROM (
     SELECT *,
         ROW_NUMBER() OVER (PARTITION BY bzp_row_id ORDER BY combined_score) AS rn_bzp,
         ROW_NUMBER() OVER (PARTITION BY ted_row_id ORDER BY combined_score) AS rn_ted
-    FROM core.v_matches_fuzzy_candidates
+    FROM core.v_matches_fuzzy_nip_candidates
 ) ranked
 WHERE rn_bzp = 1 AND rn_ted = 1;   -- wzajemnie najlepsze dopasowanie -> bezpieczne 1:1
 
--- Kandydaci w tolerancji, ktorzy przegrali rywalizacje o najlepsze dopasowanie
--- po jednej ze stron. Nie znikaja po cichu -- ladują do przegladu analitycznego.
+-- --- 2b: REGON, tylko dla tego, co zostalo niedopasowane po NIP ---
+
+CREATE OR REPLACE VIEW core.v_matches_fuzzy_regon_candidates AS
+SELECT
+    b.bzp_row_id,
+    t.ted_row_id,
+    ABS(b.data_publikacji - t.data_publikacji) AS dni_roznicy,
+    ABS(b.wartosc_szacunkowa - t.wartosc_szacunkowa) / NULLIF(b.wartosc_szacunkowa, 0) AS pct_roznicy_wartosci,
+    (ABS(b.data_publikacji - t.data_publikacji)::numeric / 7.0) +
+    (ABS(b.wartosc_szacunkowa - t.wartosc_szacunkowa) / NULLIF(b.wartosc_szacunkowa, 0) / 0.02) AS combined_score
+FROM staging.v_bzp_parsed b
+JOIN staging.v_ted_parsed t
+    ON t.regon_zamawiajacy = b.regon_zamawiajacy
+    AND ABS(b.data_publikacji - t.data_publikacji) <= 7
+    AND ABS(b.wartosc_szacunkowa - t.wartosc_szacunkowa) / NULLIF(b.wartosc_szacunkowa, 0) <= 0.02
+WHERE b.czy_powyzej_progu_ue
+  AND b.regon_zamawiajacy IS NOT NULL
+  AND b.bzp_row_id NOT IN (SELECT bzp_row_id FROM core.v_matches_exact)
+  AND b.bzp_row_id NOT IN (SELECT bzp_row_id FROM core.v_matches_fuzzy_nip)
+  AND t.ted_row_id NOT IN (SELECT ted_row_id FROM core.v_matches_exact)
+  AND t.ted_row_id NOT IN (SELECT ted_row_id FROM core.v_matches_fuzzy_nip);
+
+CREATE OR REPLACE VIEW core.v_matches_fuzzy_regon AS
+SELECT bzp_row_id, ted_row_id, 'fuzzy_heuristic_regon'::text AS match_method
+FROM (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY bzp_row_id ORDER BY combined_score) AS rn_bzp,
+        ROW_NUMBER() OVER (PARTITION BY ted_row_id ORDER BY combined_score) AS rn_ted
+    FROM core.v_matches_fuzzy_regon_candidates
+) ranked
+WHERE rn_bzp = 1 AND rn_ted = 1;
+
+-- Suma obu warstw. match_method mowi, ktora warstwa znalazla dopasowanie -- audytowalne,
+-- nie tylko "jakos sie dopasowalo".
+CREATE OR REPLACE VIEW core.v_matches_fuzzy AS
+SELECT bzp_row_id, ted_row_id, match_method FROM core.v_matches_fuzzy_nip
+UNION ALL
+SELECT bzp_row_id, ted_row_id, match_method FROM core.v_matches_fuzzy_regon;
+
+-- Kandydaci w tolerancji (z ktorejkolwiek warstwy), ktorzy przegrali rywalizacje
+-- o najlepsze dopasowanie po jednej ze stron. Nie znikaja po cichu -- ladują do
+-- przegladu analitycznego.
 CREATE OR REPLACE VIEW core.v_matches_needs_review AS
-SELECT c.bzp_row_id, c.ted_row_id, c.dni_roznicy, c.pct_roznicy_wartosci
-FROM core.v_matches_fuzzy_candidates c
-LEFT JOIN core.v_matches_fuzzy f
-    ON f.bzp_row_id = c.bzp_row_id AND f.ted_row_id = c.ted_row_id
+SELECT c.bzp_row_id, c.ted_row_id, c.dni_roznicy, c.pct_roznicy_wartosci, 'nip'::text AS warstwa
+FROM core.v_matches_fuzzy_nip_candidates c
+LEFT JOIN core.v_matches_fuzzy_nip f ON f.bzp_row_id = c.bzp_row_id AND f.ted_row_id = c.ted_row_id
+WHERE f.bzp_row_id IS NULL
+UNION ALL
+SELECT c.bzp_row_id, c.ted_row_id, c.dni_roznicy, c.pct_roznicy_wartosci, 'regon'::text AS warstwa
+FROM core.v_matches_fuzzy_regon_candidates c
+LEFT JOIN core.v_matches_fuzzy_regon f ON f.bzp_row_id = c.bzp_row_id AND f.ted_row_id = c.ted_row_id
 WHERE f.bzp_row_id IS NULL;
 
 -- ============================================================
