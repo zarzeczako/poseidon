@@ -86,6 +86,69 @@
 > **Q: Jak wybierasz między self-hosted a managed bazą danych w projekcie małej/średniej skali?**
 > A: Pytam, co faktycznie chcę pokazać/nauczyć się i ile operacyjnego narzutu jestem gotów utrzymywać. Self-hosted (Docker+VM) uczy realnej infrastruktury, ale kosztuje czas niezwiązany z celem projektu. Managed serverless (Neon) daje "prawdziwą chmurę" bez tego narzutu — właściwy wybór, gdy projekt ma dowieźć wynik analityczny, nie kompetencję DevOps.
 
+### Rozpakowanie wieloczęściowych postępowań: normalizacja przed unnest, nie unnest na oślep
+
+**Decyzja:** `staging.v_bzp_parts` normalizuje `contractors` jawnym `CASE jsonb_typeof(...)` (obiekt →
+opakuj w tablicę jednoelementową; tablica → zostaw) PRZED próbą `jsonb_array_elements(...) WITH ORDINALITY`.
+
+**Odrzucone alternatywy:** Zakładanie, że `contractors` zawsze jest tablicą i rozpakowywanie wprost —
+odrzucone, bo na realnych danych potwierdzono, że przy dokładnie 1 części `contractors` jest gołym
+obiektem JSON, nie tablicą jednoelementową. Bez normalizacji `jsonb_array_elements()` albo wywali błąd,
+albo (gorzej) zwróci błędne dane dla najprostszego, najczęstszego przypadku (postępowanie jednoczęściowe).
+
+**Dlaczego:** To był pomysł Architekta ("po prostu ifem") — słuszny w duchu, tu sformalizowany jako
+idiomatyczny wzorzec Postgresa: `CASE` normalizuje kształt, `WITH ORDINALITY` zachowuje pozycję (`ord`),
+żeby dało się ją później zestawić 1:1 z pozycją w `procedureResult` (rozdzielonym średnikiem) — to jest
+część, której sam "if" by nie załatwił: nie wystarczy obsłużyć oba kształty, trzeba też nie zgubić, który
+wynik należy do którego kontrahenta.
+
+**Q&A rekrutacyjne:**
+> **Q: Jak radzisz sobie z API, które zwraca niespójny kształt JSON w zależności od liczby elementów (obiekt vs tablica jednoelementowa)?**
+> A: Normalizuję kształt jawnie na wejściu (`jsonb_typeof` + `CASE`) zamiast pisać kod, który zakłada jeden kształt i się wywraca na drugim. W Postgresie dodatkowo pilnuję pozycji przez `WITH ORDINALITY`, jeśli dalsza logika zależy od kolejności elementów względem innego, równoległego pola.
+
+### Flaga `czy_osoba_fizyczna` zamiast cichej utraty danych w NIP
+
+**Decyzja:** `staging.v_bzp_parts.wykonawca_czy_osoba_fizyczna` odróżnia "wykonawca to osoba fizyczna bez
+NIP" (`contractorNationalId` = tekst typu "brak - podmiot nie prowadzący działalności gospodarczej") od
+"brak danych" (`contractorNationalId` = NULL, np. unieważniona część postępowania).
+
+**Odrzucone alternatywy:** Zostawienie samego `wykonawca_nip = NULL` bez dodatkowej flagi — odrzucone,
+bo to zaciera różnicę między "nie wiemy" a "wiemy, że to osoba fizyczna" — a to druga rzecz jest realnym,
+analitycznie ciekawym sygnałem (np. do przyszłej analizy: czy małe zamówienia trafiają częściej do osób
+fizycznych bez działalności).
+
+**Dlaczego:** Zatwierdzone przez Architekta 2026-08-04. Koszt utrzymania tej flagi jest zerowy (jedna
+kolumna wyliczana), a odzyskuje informację, którą inaczej byśmy bezpowrotnie spłaszczyli do NULL.
+
+**Q&A rekrutacyjne:**
+> **Q: Dlaczego "brak danych" i "wiemy, że tej wartości nie ma z konkretnego powodu" to nie to samo w modelu danych?**
+> A: Bo NULL jest przeciążony — miesza ze sobą różne przyczyny brakujących danych (błąd źródła, faktyczny brak, nie dotyczy) w jedną wartość, którą traktuje się jednakowo we wszystkich dalszych agregacjach. Jeśli konkretna przyczyna ma wartość analityczną, wart jest osobnej flagi, żeby nie trzeba jej było odgadywać na końcu pipeline'u.
+
+### Parsowanie SEKCJA VI-VIII z htmlBody: Python, regex na stałych kodach pól
+
+**Decyzja:** `etl/parse_bzp_form.py` wyciąga ponumerowane pola formularza (`6.1.)`, `6.2.)`, `8.2.)` itd.)
+z `htmlBody` przez regex na wzorcu `<h3...>{KOD}.) {ETYKIETA}: <span class="normal">{WARTOŚĆ}</span>`,
+strukturalnie (bez decyzji biznesowych, bez typowania wartości) — spójnie z tym, jak Python traktuje XML z TED.
+
+**Odrzucone alternatywy:** `regexp_matches()` bezpośrednio w SQL — odrzucone z tego samego powodu co przy
+TED: przy wieloletnim zbiorze (2021-2026) i możliwych zmianach szablonu formularza w czasie, utrzymanie
+takiej logiki jako widoków SQL byłoby nie do ogarnięcia. Python trzyma tę złożoność w jednym, testowalnym miejscu.
+
+**Dlaczego:** SEKCJA V-VIII powtarzają się per "Część N" w treści HTML, ale znacznik części bywa
+wyrażony na dwa różne sposoby (`<h3>Część N</h3>` ALBO `(dla części N)` w nagłówku SEKCJA) — i przy
+postępowaniu **jednoczęściowym formularz w ogóle pomija numerację części**. Odkryte dopiero przy
+faktycznym uruchomieniu parsera na 3 realnych próbkach (nie teoretycznie): bez jawnej reguły "SEKCJA
+V-VIII bez żadnego znacznika = domyślnie Część 1" pola jednoczęściowych postępowań lądowały w nagłówku
+zamiast w `czesci[1]` — niespójnie z wieloczęściowymi. Poprawione i zwalidowane przed dostarczeniem.
+
+**Ograniczenie środowiskowe:** Python nie jest zainstalowany na tej maszynie (tylko pusta zaślepka
+Microsoft Store) — logika była walidowana 1:1 przez odpowiednik w PowerShell na realnych danych z
+`recon/`, ale sam plik `.py` nie został jeszcze uruchomiony. Patrz `STATE.md` §4.
+
+**Q&A rekrutacyjne:**
+> **Q: Skąd wiadomo, że parser strukturalny (regex na formularzu) jest "bezpieczny", skoro to wciąż parsowanie HTML?**
+> A: Bo różnica nie jest "HTML vs nie-HTML", tylko "czy źródło ma stały, wymuszony prawnie kontrakt formatu". Tu kody pól (6.1, 6.2...) pochodzą z rozporządzenia, nie z czyjegoś swobodnego HTML-a — więc parser można zwalidować raz na próbce i traktować odchylenia (kod się nie znalazł, wartość się nie sparsowała) jako sygnał do przeglądu, a nie normalny szum.
+
 ---
 
 ## Otwarte wątki nazewnictwa (do rozstrzygnięcia z Architektem)

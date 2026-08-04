@@ -28,9 +28,19 @@ CREATE OR REPLACE VIEW staging.v_ted_parsed AS
 SELECT
     id AS ted_row_id,
     notice_id AS ted_notice_id,
-    staging.clean_nip(payload->>'national_registration_number') AS nip_zamawiajacy,
-    (payload->>'publication_date')::date                         AS data_publikacji,
-    (payload->>'estimated_value')::numeric                       AS wartosc_szacunkowa,
+    -- Potwierdzone na Search API v3 (recon/FINDINGS_TED.md): identyfikator bywa NIP
+    -- (czasem z etykietą "NIP: " i myslnikami -- clean_nip() to ogarnia) ALBO REGON
+    -- (9 cyfr -- clean_nip() poprawnie zwroci NULL, bo wymaga dokladnie 10). Realna
+    -- konsekwencja: czesc par BZP<->TED nie dopasuje sie po NIP, bo TED ma tam REGON.
+    -- Fallback na REGON nierozstrzygniety, patrz FINDINGS_TED.md Znalezisko 2.
+    staging.clean_nip(payload->>'organisation-identifier-buyer') AS nip_zamawiajacy,
+    (payload->>'publication-date')::date                         AS data_publikacji,
+    -- UWAGA: NIE 'tender-value' (to cena WYGRANEJ oferty -- wynik, nie szacunek).
+    -- Do matchingu potrzebny szacunek po stronie TED, kandydat 'estimated-value-cur-lot',
+    -- jeszcze niepotwierdzony bezposrednio (patrz FINDINGS_TED.md Znalezisko 1). Uzycie
+    -- tender-value do matchingu zniek​stalcaloby wynik, bo roznica szacunek<->cena
+    -- koncowa to dokladnie to, co ten projekt mierzy.
+    NULL::numeric                                                 AS wartosc_szacunkowa,
     payload
 FROM staging.ted_notices_raw;
 

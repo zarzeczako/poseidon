@@ -109,14 +109,15 @@ prostu gubić ten przypadek jako "brak danych", bo to co innego niż błąd/brak
 - TED w ogóle nietknięty (3 sierpnia była zresztą zaplanowana przerwa techniczna w dostępie do TED,
   7:00-8:00 — widoczne w komunikatach na stronie głównej e-Zamówienia)
 - Pozostałe ~33 wartości NoticeType z glosariusza
-- Realny mechanizm paginacji przy dużych zakresach dat (czy jest `totalCount`/nagłówek z liczbą stron?) —
-  próbka miała tylko PageSize=3, bez testu stronicowania
-- Czy istnieje endpoint "szczegóły pojedynczego ogłoszenia" bogatszy niż lista
+- Wersjonowanie szablonu formularza HTML na przestrzeni 2021-2026 (widziana tylko 1 wersja na żywo)
+- Czy pole `wartosc_szacunkowa` (kwota przeznaczona na sfinansowanie) jest strukturalne, czy też tylko
+  w HTML (SEKCJA IV) — jeszcze nie sprawdzone wprost, na razie `v_bzp_parsed.wartosc_szacunkowa` to NULL
 
-## Sugerowany następny krok (Twój, ręcznie)
+## Decyzja do Ciebie: gdzie ma się dziać wyciąganie pól z SEKCJA VI (Python czy SQL)?
 
-Otwórz `bzp_sample_tenderresult.json` w edytorze, znajdź w `htmlBody` sekcję z liczbą ofert/ceną
-(szukaj "najkorzystniejsz" albo "LICZBA OTRZYMANYCH OFERT") i zobacz, czy da się to wyciągnąć
-regexem/parserem HTML wiarygodnie na wielu wariantach formularza, czy to zbyt kruche. To bezpośrednio
-decyduje, jak trudna będzie Faza 1 po stronie BZP — i czy w ogóle warto próbować, czy szukać innego
-źródła dla tych dwóch pól.
+Ten sam wybór już raz podjęliśmy dla TED (Python robi strukturalny XML→JSON, zero logiki biznesowej,
+żeby nie pisać `xmltable()` na kilkunastu wersjach schematu w czystym SQL). Proponuję dokładnie tę samą
+zasadę tutaj: Python wyciąga ponumerowane pola z `htmlBody` regexem do nazwanych kluczy JSON (structural
+parsing, żadnej decyzji biznesowej), ląduje to jako dodatkowe JSONB obok surowego `htmlBody` — a nie
+próbujemy tego robić `regexp_matches()` w SQL, bo przy kilkunastu wersjach formularza na przestrzeni
+2021-2026 byłoby to nie do utrzymania w widokach SQL. Zgadzasz się, czy wolisz inaczej?
