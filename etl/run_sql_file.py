@@ -5,15 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import psycopg
-
-
-def load_dotenv_var(name: str, env_path: Path) -> str:
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith(f"{name}="):
-            return line.split("=", 1)[1].strip()
-    raise RuntimeError(f"{name} not found in {env_path}")
+from db import connect
 
 
 def main() -> None:
@@ -22,11 +14,9 @@ def main() -> None:
         sys.exit(1)
 
     sql_path = Path(sys.argv[1])
-    env_path = Path(__file__).parent.parent / ".env"
-    database_url = load_dotenv_var("POSEIDON_DATABASE_URL", env_path)
-
     sql = sql_path.read_text(encoding="utf-8")
-    with psycopg.connect(database_url, autocommit=True) as conn:
+    with connect() as conn:
+        conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(sql)
     print(f"OK: {sql_path} wykonany bez bledow")

@@ -23,12 +23,15 @@ CREATE INDEX idx_bzp_notices_raw_notice_id ON staging.bzp_notices_raw (notice_id
 
 CREATE TABLE staging.ted_notices_raw (
     id              BIGSERIAL PRIMARY KEY,
-    notice_id       TEXT NOT NULL,                -- numer ogloszenia TED/OJ S
+    notice_id       TEXT NOT NULL,                -- numer ogloszenia TED (publication-number)
     fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    source_file     TEXT NOT NULL,                 -- nazwa paczki ZIP/XML pochodzenia, dla lineage
+    source_file     TEXT NOT NULL,                 -- identyfikator zrodla (np. "Search API v3"), dla lineage
     eforms_version  TEXT,                          -- wersja schematu eForms, jesli rozpoznana
-    raw_xml         TEXT NOT NULL,                 -- oryginalny XML 1:1, do audytu/debugowania
-    payload         JSONB NOT NULL,                -- strukturalny XML->JSON, zero logiki biznesowej
+    -- raw_xml: NULL dla Search API v3 (zwraca JSON, nie XML). Pelny eForms XML mozna
+    -- pobrac osobno przez payload->links->xml->MUL, jesli kiedys potrzebny -- nie
+    -- pobierany domyslnie (dodatkowe zapytanie na kazde ogloszenie).
+    raw_xml         TEXT,
+    payload         JSONB NOT NULL,                -- odpowiedz Search API v3, nietknieta
     UNIQUE (notice_id)
 );
 
